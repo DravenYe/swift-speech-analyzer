@@ -125,12 +125,10 @@ func startLive(locale: Locale) async throws {
             guard !text.isEmpty else { continue }
 
             if result.isFinal {
-                // 结束 volatile 行，输出最终结果
                 if onVolatileLine { print("\r\u{1B}[K", terminator: "") }
                 print(text)
                 onVolatileLine = false
             } else {
-                // volatile：覆盖当前行，截断避免换行
                 let preview = String(text.prefix(80))
                 print("\r\u{1B}[K\u{1B}[2m⟳ \(preview)\u{1B}[0m", terminator: "")
                 onVolatileLine = true
@@ -139,12 +137,19 @@ func startLive(locale: Locale) async throws {
         }
     }
 
-    signal(SIGINT) { _ in
-        print("\n\n⏹ 识别结束")
-        exit(0)
+    // Ctrl+C：停止录音，等待剩余内容转写完再退出
+    signal(SIGINT, SIG_IGN)
+    let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+    sigintSource.setEventHandler {
+        print("\n⏸ 停止录音，正在完成剩余转写...\n")
+        audioEngine.inputNode.removeTap(onBus: 0)
+        audioEngine.stop()
+        inputBuilder.finish()
     }
+    sigintSource.resume()
 
     try await recognizerTask.value
+    print("\n⏹ 完成")
 }
 
 // MARK: - Usage
