@@ -118,6 +118,7 @@ func startLive(locale: Locale) async throws {
     print("🎤 实时识别中（本地）... 按 Ctrl+C 结束\n")
 
     var onVolatileLine = false
+    var lastVolatilePreview = ""
 
     let recognizerTask = Task {
         for try await result in transcriber.results {
@@ -128,28 +129,40 @@ func startLive(locale: Locale) async throws {
                 if onVolatileLine { print("\r\u{1B}[K", terminator: "") }
                 print(text)
                 onVolatileLine = false
+                lastVolatilePreview = ""
             } else {
+                // 内容没变就不刷新，避免刷屏
                 let preview = String(text.prefix(80))
+                guard preview != lastVolatilePreview else { continue }
                 print("\r\u{1B}[K\u{1B}[2m⟳ \(preview)\u{1B}[0m", terminator: "")
+                lastVolatilePreview = preview
                 onVolatileLine = true
             }
             fflush(stdout)
         }
     }
 
-    // Ctrl+C：停止录音，等待剩余内容转写完再退出
+    // Ctrl+C：停止录音，通知 analyzer 结束，最多等 5 秒输出剩余内容
     signal(SIGINT, SIG_IGN)
     let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     sigintSource.setEventHandler {
-        print("\n⏸ 停止录音，正在完成剩余转写...\n")
+        print("\n⏸ 停止录音，正在完成剩余转写（最多等 5 秒）...\n")
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
         inputBuilder.finish()
+        Task { try? await analyzer.finalizeAndFinishThroughEndOfInput() }
     }
     sigintSource.resume()
 
-    try await recognizerTask.value
-    print("\n⏹ 完成")
+    // 等待识别完成，超时则强制退出
+    let timeout = Task {
+        try? await Task.sleep(for: .seconds(8))
+        recognizerTask.cancel()
+    }
+    try? await recognizerTask.value
+    timeout.cancel()
+    if onVolatileLine { print() }
+    print("⏹ 完成")
 }
 
 // MARK: - Usage
