@@ -1,6 +1,60 @@
 import Foundation
 import Speech
 import AVFoundation
+import NaturalLanguage
+
+// MARK: - Language Detection
+
+// NLLanguage → SpeechTranscriber locale 映射
+let languageLocaleMap: [NLLanguage: String] = [
+    .simplifiedChinese:  "zh-CN",
+    .traditionalChinese: "zh-TW",
+    .english:            "en-US",
+    .japanese:           "ja-JP",
+    .korean:             "ko-KR",
+    .french:             "fr-FR",
+    .german:             "de-DE",
+    .spanish:            "es-ES",
+    .portuguese:         "pt-BR",
+    .italian:            "it-IT",
+    .dutch:              "nl-NL",
+    .russian:            "ru-RU",
+    .arabic:             "ar-SA",
+]
+
+func detectLocale(from text: String) -> Locale {
+    let recognizer = NLLanguageRecognizer()
+    recognizer.processString(text)
+    guard let lang = recognizer.dominantLanguage,
+          let identifier = languageLocaleMap[lang] else {
+        return .current
+    }
+    return Locale(identifier: identifier)
+}
+
+// MARK: - Locale Normalization
+
+// 把系统 Locale（如 zh-Hans_US）规范化为 SpeechTranscriber 支持的格式（如 zh-CN）
+func normalizeLocale(_ locale: Locale) -> Locale {
+    let lang = locale.language.languageCode?.identifier ?? "en"
+    let script = locale.language.script?.identifier ?? ""
+
+    switch lang {
+    case "zh": return Locale(identifier: script == "Hant" ? "zh-TW" : "zh-CN")
+    case "en": return Locale(identifier: "en-US")
+    case "ja": return Locale(identifier: "ja-JP")
+    case "ko": return Locale(identifier: "ko-KR")
+    case "fr": return Locale(identifier: "fr-FR")
+    case "de": return Locale(identifier: "de-DE")
+    case "es": return Locale(identifier: "es-ES")
+    case "pt": return Locale(identifier: "pt-BR")
+    case "it": return Locale(identifier: "it-IT")
+    case "nl": return Locale(identifier: "nl-NL")
+    case "ru": return Locale(identifier: "ru-RU")
+    case "ar": return Locale(identifier: "ar-SA")
+    default:   return Locale(identifier: "\(lang)-\(locale.region?.identifier ?? "US")")
+    }
+}
 
 // MARK: - Model Management
 
@@ -24,7 +78,6 @@ func ensureModel(for transcriber: SpeechTranscriber, locale: Locale) async throw
 
 // MARK: - File Transcription
 
-// 独立 async 函数，与 analyzeSequence 并发运行
 func collectResults(from transcriber: SpeechTranscriber, showTimestamps: Bool) async throws -> String {
     var fullText = ""
     for try await result in transcriber.results {
@@ -42,32 +95,66 @@ func collectResults(from transcriber: SpeechTranscriber, showTimestamps: Bool) a
     return fullText
 }
 
-func transcribeFile(url: URL, locale: Locale, showTimestamps: Bool) async throws {
-    guard FileManager.default.fileExists(atPath: url.path) else {
-        print("❌ 文件不存在: \(url.path)"); exit(1)
-    }
-
+func runTranscription(url: URL, locale: Locale, showTimestamps: Bool) async throws -> String {
     let transcriber = SpeechTranscriber(
         locale: locale,
         transcriptionOptions: [],
         reportingOptions: [],
         attributeOptions: showTimestamps ? [.audioTimeRange] : []
     )
-
     try await ensureModel(for: transcriber, locale: locale)
-    print("🎵 正在转写: \(url.lastPathComponent)\n")
 
-    // 并发：结果收集与文件分析同时进行
     async let textFuture = collectResults(from: transcriber, showTimestamps: showTimestamps)
-
     let audioFile = try AVAudioFile(forReading: url)
     let analyzer = SpeechAnalyzer(modules: [transcriber])
     if let lastSample = try await analyzer.analyzeSequence(from: audioFile) {
         try await analyzer.finalizeAndFinish(through: lastSample)
     }
+    return try await textFuture
+}
 
-    let text = try await textFuture
+func transcribeFile(url: URL, langArg: String?, showTimestamps: Bool) async throws {
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        print("❌ 文件不存在: \(url.path)"); exit(1)
+    }
 
+    let locale: Locale
+
+    if langArg == "auto" {
+        // 第一遍用 en-US 探测，取样本检测语言
+        print("🔍 正在检测语言...\n")
+        let probeTranscriber = SpeechTranscriber(
+            locale: Locale(identifier: "en-US"),
+            transcriptionOptions: [],
+            reportingOptions: [],
+            attributeOptions: []
+        )
+        try await ensureModel(for: probeTranscriber, locale: Locale(identifier: "en-US"))
+
+        async let probeFuture = collectResults(from: probeTranscriber, showTimestamps: false)
+        let probeFile = try AVAudioFile(forReading: url)
+        let probeAnalyzer = SpeechAnalyzer(modules: [probeTranscriber])
+        if let last = try await probeAnalyzer.analyzeSequence(from: probeFile) {
+            try await probeAnalyzer.finalizeAndFinish(through: last)
+        }
+        let probeText = try await probeFuture
+
+        locale = detectLocale(from: probeText)
+        print("🌐 检测到语言: \(locale.identifier)\n")
+
+        // 如果检测结果就是 en-US，直接用探测结果，不需要第二遍
+        if locale.identifier.hasPrefix("en") {
+            print("🎵 正在转写: \(url.lastPathComponent)\n")
+            if showTimestamps { print("📝 完整文本:") } else { print("📝 转写结果:") }
+            print(probeText)
+            return
+        }
+    } else {
+        locale = langArg.map { Locale(identifier: $0) } ?? normalizeLocale(.current)
+    }
+
+    print("🎵 正在转写: \(url.lastPathComponent)\n")
+    let text = try await runTranscription(url: url, locale: locale, showTimestamps: showTimestamps)
     if showTimestamps { print("\n📝 完整文本:") } else { print("📝 转写结果:") }
     print(text)
 }
@@ -109,7 +196,7 @@ func startLive(locale: Locale) async throws {
     }
 
     try audioEngine.start()
-    print("🎤 实时识别中（本地）... 按 Ctrl+C 结束\n")
+    print("🎤 实时识别中（\(locale.identifier)）... 按 Ctrl+C 结束\n")
 
     var onVolatileLine = false
     var lastVolatilePreview = ""
@@ -125,7 +212,6 @@ func startLive(locale: Locale) async throws {
                 onVolatileLine = false
                 lastVolatilePreview = ""
             } else {
-                // 内容没变就不刷新，避免刷屏
                 let preview = String(text.prefix(80))
                 guard preview != lastVolatilePreview else { continue }
                 print("\r\u{1B}[K\u{1B}[2m⟳ \(preview)\u{1B}[0m", terminator: "")
@@ -136,8 +222,6 @@ func startLive(locale: Locale) async throws {
         }
     }
 
-    // Ctrl+C：停止录音，通知 analyzer 结束，最多等 5 秒输出剩余内容
-    // 超时任务只在 Ctrl+C 之后才启动，不提前计时
     var timeoutTask: Task<Void, Never>? = nil
 
     signal(SIGINT, SIG_IGN)
@@ -148,7 +232,6 @@ func startLive(locale: Locale) async throws {
         audioEngine.stop()
         inputBuilder.finish()
         Task { try? await analyzer.finalizeAndFinishThroughEndOfInput() }
-        // 按下 Ctrl+C 后才开始 8 秒倒计时
         timeoutTask = Task {
             try? await Task.sleep(for: .seconds(8))
             recognizerTask.cancel()
@@ -167,12 +250,13 @@ func startLive(locale: Locale) async throws {
 func printUsage() {
     print("""
     用法:
-      转写文件:   ./transcribe file <路径> [--timestamps]
-      实时麦克风: ./transcribe live
-      指定语言:   ./transcribe file <路径> --lang en-US
+      转写文件:     ./transcribe file <路径> [--timestamps]
+      实时麦克风:   ./transcribe live
+      指定语言:     ./transcribe file <路径> --lang en-US
+      自动检测语言: ./transcribe file <路径> --lang auto
 
     支持格式: mp3, m4a, wav, aiff, flac, caf 等
-    支持语言: zh-CN, zh-TW, en-US, ja-JP 等
+    支持语言: zh-CN, zh-TW, en-US, ja-JP, ko-KR, fr-FR, de-DE 等
     需要: macOS 26+
     """)
 }
@@ -183,17 +267,22 @@ let args = CommandLine.arguments
 guard args.count >= 2 else { printUsage(); exit(1) }
 
 let langIndex = args.firstIndex(of: "--lang").map { $0 + 1 }
-let locale = Locale(identifier: langIndex.map { args[$0] } ?? "zh-CN")
+let langArg = langIndex.map { args[$0] }  // nil = 系统语言, "auto" = 自动检测, 其他 = 指定语言
 let showTimestamps = args.contains("--timestamps")
+
+// live 模式：auto 回退到系统语言（规范化）
+let liveLocale = (langArg == nil || langArg == "auto")
+    ? normalizeLocale(.current)
+    : Locale(identifier: langArg!)
 
 Task {
     do {
         switch args[1] {
         case "file":
             guard args.count >= 3 else { print("❌ 请提供音频文件路径"); exit(1) }
-            try await transcribeFile(url: URL(fileURLWithPath: args[2]), locale: locale, showTimestamps: showTimestamps)
+            try await transcribeFile(url: URL(fileURLWithPath: args[2]), langArg: langArg, showTimestamps: showTimestamps)
         case "live":
-            try await startLive(locale: locale)
+            try await startLive(locale: liveLocale)
         default:
             print("❌ 未知命令: \(args[1])")
             printUsage()
