@@ -75,43 +75,37 @@ func transcribeFile(url: URL, locale: Locale, showTimestamps: Bool) async throws
 // MARK: - Live Transcription
 
 func startLive(locale: Locale) async throws {
-    let transcriber = SpeechTranscriber(
-        locale: locale,
-        transcriptionOptions: [],
-        reportingOptions: [.volatileResults],
-        attributeOptions: []
-    )
+    let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
 
     try await ensureModel(for: transcriber, locale: locale)
 
-    let analyzer = SpeechAnalyzer(modules: [transcriber])
     guard let analyzerFormat = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber]) else {
         print("❌ 无法获取音频格式"); exit(1)
     }
 
-    let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
-    try await analyzer.start(inputSequence: inputSequence)
-
-    // 音频引擎 + 格式转换
     let audioEngine = AVAudioEngine()
     let inputNode = audioEngine.inputNode
     let hardwareFormat = inputNode.outputFormat(forBus: 0)
+    let converter = AVAudioConverter(from: hardwareFormat, to: analyzerFormat)!
 
-    guard let converter = AVAudioConverter(from: hardwareFormat, to: analyzerFormat) else {
-        print("❌ 无法创建音频格式转换器"); exit(1)
-    }
+    let (inputSequence, inputBuilder) = AsyncStream<AnalyzerInput>.makeStream()
+    let analyzer = SpeechAnalyzer(inputSequence: inputSequence, modules: [transcriber])
 
     inputNode.installTap(onBus: 0, bufferSize: 4096, format: hardwareFormat) { buffer, _ in
-        let frameCapacity = AVAudioFrameCount(
-            Double(buffer.frameLength) * analyzerFormat.sampleRate / hardwareFormat.sampleRate
-        )
-        guard let converted = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: frameCapacity) else { return }
-        var err: NSError?
-        converter.convert(to: converted, error: &err) { _, status in
+        let ratio = analyzerFormat.sampleRate / hardwareFormat.sampleRate
+        let frameCount = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up))
+        guard frameCount > 0,
+              let outBuffer = AVAudioPCMBuffer(pcmFormat: analyzerFormat, frameCapacity: frameCount) else { return }
+        var didProvide = false
+        var convError: NSError?
+        converter.convert(to: outBuffer, error: &convError) { _, status in
+            guard !didProvide else { status.pointee = .noDataNow; return nil }
+            didProvide = true
             status.pointee = .haveData
             return buffer
         }
-        if err == nil { inputBuilder.yield(AnalyzerInput(buffer: converted)) }
+        guard convError == nil, outBuffer.frameLength > 0 else { return }
+        inputBuilder.yield(AnalyzerInput(buffer: outBuffer))
     }
 
     try audioEngine.start()
@@ -143,24 +137,27 @@ func startLive(locale: Locale) async throws {
     }
 
     // Ctrl+C：停止录音，通知 analyzer 结束，最多等 5 秒输出剩余内容
+    // 超时任务只在 Ctrl+C 之后才启动，不提前计时
+    var timeoutTask: Task<Void, Never>? = nil
+
     signal(SIGINT, SIG_IGN)
     let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     sigintSource.setEventHandler {
-        print("\n⏸ 停止录音，正在完成剩余转写（最多等 5 秒）...\n")
+        print("\n⏸ 停止录音，正在完成剩余转写...\n")
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
         inputBuilder.finish()
         Task { try? await analyzer.finalizeAndFinishThroughEndOfInput() }
+        // 按下 Ctrl+C 后才开始 8 秒倒计时
+        timeoutTask = Task {
+            try? await Task.sleep(for: .seconds(8))
+            recognizerTask.cancel()
+        }
     }
     sigintSource.resume()
 
-    // 等待识别完成，超时则强制退出
-    let timeout = Task {
-        try? await Task.sleep(for: .seconds(8))
-        recognizerTask.cancel()
-    }
     try? await recognizerTask.value
-    timeout.cancel()
+    timeoutTask?.cancel()
     if onVolatileLine { print() }
     print("⏹ 完成")
 }
